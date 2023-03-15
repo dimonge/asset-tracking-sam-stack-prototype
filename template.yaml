@@ -1,0 +1,255 @@
+# This is the SAM template that represents the architecture of your serverless application
+# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-template-basics.html
+
+# The AWSTemplateFormatVersion identifies the capabilities of the template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/format-version-structure.html
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  asset tracking-platform
+
+# Transform section specifies one or more macros that AWS CloudFormation uses to process your template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/transform-section-structure.html
+Transform:
+- AWS::Serverless-2016-10-31
+
+Globals:
+  Function: 
+    CodeUri: dist/handlers
+    Runtime: nodejs14.x
+    Tracing: Active            
+    Architectures:
+      - x86_64
+    MemorySize: 128
+    Timeout: 100  
+
+Parameters:
+  AppName:
+    Description: "Asset tracking stack"
+    Type: String
+    Default: asset-tracking
+  EnvType:
+    Description: "Environment type (e.g dev, stag, prod)" 
+    Type: String
+    Default: dev 
+  
+# Resources declares the AWS resources that you want to include in the stack
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resources-section-structure.html
+Resources:
+  # Each Lambda function is defined by properties:
+  # https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+
+  
+  AssetTrackingDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      TableName: AssetTrackingEvents
+      AttributeDefinitions:
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema: # primary key
+        - AttributeName: created_at
+          KeyType: HASH
+        - AttributeName: user_id
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+    
+
+  AssetTrackingStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      RetentionPeriodHours: 24
+      ShardCount: 1
+  
+  # Asset tracking API
+  AssetDataIngestApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: "AssetDataIngestApi"
+      AuthenticationType: "API_KEY"
+      XrayEnabled: true
+      
+  AssetDataIngestApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt AssetDataIngestApi.ApiId
+
+  # Asset Api schema
+  AssetDataIngestApiSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties: 
+      ApiId: !GetAtt AssetDataIngestApi.ApiId
+      Definition: |
+        schema {
+          mutation: Mutation
+          query: Query
+        }
+
+        type Event {
+          data: AWSJSON
+          type: String
+        }
+
+        input EventInput {
+          data: AWSJSON!
+          type: String!
+        }
+
+        type Mutation {
+          writeEvent(event: EventInput!): Event
+        }
+        type Query {
+          readEvent(eventId: String!): Event
+        }
+
+  # Partner Lambda function for Data source
+  DataIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: asset-data-ingest.handler
+      Description: Asset Command function for sending location tracking
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref AssetTrackingStream
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonKinesisFullAccess
+  
+  AssetProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: asset-process.handler
+      Description: Lambda that process the asset tracking data in kinesis and store in DynamoDB
+      Policies:
+        - AmazonKinesisFullAccess
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          ASSET_TRACKING_TABLE_NAME: AssetTrackingEvents
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt DataProcessConsumer.ConsumerARN
+            StartingPosition: LATEST
+            BatchSize: 100
+  
+  # Process location stream
+  processLocationStream:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: process-location-stream.handler
+      Policies:
+        - AWSLambdaDynamoDBExecutionRole        
+        - AWSAppSyncInvokeFullAccess
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AssetTrackingDBTable.StreamArn
+            BatchSize: 100
+            StartingPosition: TRIM_HORIZON
+
+  # Service role
+  assetDataIngestServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+      Path: "/"
+      
+  lambdaAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: lambdaAccessPolicy
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: 
+              - lambda:invokeFunction
+            Resource:
+              - !GetAtt DataIngestFunction.Arn          
+      Roles:
+        - Ref: "assetDataIngestServiceRole"
+  
+  genesisKinesisAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: genesisKinesisAccessPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - kinesis:Describe*
+              - kinesis:Put*
+              - kinesis:Get*
+              - kinesis:List*
+            Resource:
+              - !GetAtt DataIngestFunction.Arn
+      Roles:
+        - Ref: "assetDataIngestServiceRole"
+
+  # Data source     
+  AssetDataIngestDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AssetDataIngestApi.ApiId
+      Description: "Asset tracking data source"
+      Name: "AssetDataIngestDataSource"
+      Type: "AWS_LAMBDA"
+      ServiceRoleArn: !GetAtt assetDataIngestServiceRole.Arn
+      LambdaConfig: 
+        LambdaFunctionArn: !GetAtt DataIngestFunction.Arn
+
+  # resolver
+  assetDataIngestCommandReadResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AssetDataIngestApi.ApiId
+      TypeName: Query
+      FieldName: readEvent
+      DataSourceName: !GetAtt AssetDataIngestDataSource.Name
+
+  assetDataIngestWriteResolver:
+    Type: AWS::AppSync::Resolver
+    Properties: 
+      ApiId: !GetAtt AssetDataIngestApi.ApiId
+      TypeName: Mutation
+      FieldName: writeEvent
+      DataSourceName: !GetAtt AssetDataIngestDataSource.Name
+
+  # Lambda consumer for Datasource stack
+  DataProcessConsumer:
+    Type: AWS::Kinesis::StreamConsumer
+    Properties:
+      ConsumerName: DataProcessConsumer
+      StreamARN: !GetAtt AssetTrackingStream.Arn
+
+Outputs:
+  AssetDataIngestApi:
+    Description: "Asset ingestion api"
+    Value: !GetAtt AssetDataIngestApi.Arn
+  AssetDataIngestApiKey:
+    Description: "Asset ingestion api key"
+    Value: !GetAtt AssetDataIngestApiKey.Arn
+  AssetDataIngestGraphQLUrl:
+    Description: "Asset ingestion graphql url"
+    Value: !GetAtt AssetDataIngestApi.GraphQLUrl
+  AssetTrackingStream:
+    Description: "Asset tracking stream"
+    Value: !GetAtt AssetTrackingStream.Arn
